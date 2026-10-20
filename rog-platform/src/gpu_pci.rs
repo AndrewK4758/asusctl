@@ -187,16 +187,26 @@ fn nvml() -> Option<&'static nvml_wrapper::Nvml> {
     Some(NVML.get_or_init(|| nvml))
 }
 
-fn read_nvml_temp() -> Option<f32> {
-    let device = nvml()?.device_by_index(0).ok()?;
+fn nvml_device(dev_path: &Path) -> Option<nvml_wrapper::Device<'static>> {
+    let nvml = nvml()?;
+    if let Some(bus_id) = dev_path.file_name().and_then(|n| n.to_str())
+        && bus_id.contains(':')
+    {
+        return nvml.device_by_pci_bus_id(bus_id).ok();
+    }
+    nvml.device_by_index(0).ok()
+}
+
+fn read_nvml_temp(dev_path: &Path) -> Option<f32> {
+    let device = nvml_device(dev_path)?;
     let temp = device
         .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
         .ok()?;
     Some(temp as f32)
 }
 
-fn read_nvml_usage() -> Option<f32> {
-    let device = nvml()?.device_by_index(0).ok()?;
+fn read_nvml_usage(dev_path: &Path) -> Option<f32> {
+    let device = nvml_device(dev_path)?;
     let rates = device.utilization_rates().ok()?;
     Some(rates.gpu as f32)
 }
@@ -213,8 +223,8 @@ fn read_hwmon_freq(dir: &Path) -> Option<f32> {
     (hz > 0.0).then(|| hz / 1_000_000.0)
 }
 
-fn read_nvml_freq() -> Option<f32> {
-    let device = nvml()?.device_by_index(0).ok()?;
+fn read_nvml_freq(dev_path: &Path) -> Option<f32> {
+    let device = nvml_device(dev_path)?;
     let clock = device
         .clock_info(nvml_wrapper::enum_wrappers::device::Clock::Graphics)
         .ok()?;
@@ -232,6 +242,8 @@ pub struct Device {
     is_dgpu: bool,
     /// Vendor:Device PCI ID string.
     pci_id: String,
+    /// Human-readable GPU model name.
+    name: String,
 }
 
 impl Device {
@@ -245,6 +257,10 @@ impl Device {
 
     pub fn pci_id(&self) -> &str {
         &self.pci_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Read a file underneath the sys object.
@@ -276,7 +292,7 @@ impl Device {
     fn probe_hwmon(
         &self,
         read: fn(&Path) -> Option<f32>,
-        nvml: fn() -> Option<f32>,
+        nvml: fn(&Path) -> Option<f32>,
     ) -> Option<f32> {
         if self.is_dgpu && self.get_runtime_status().unwrap_or_default() != GfxPower::Active {
             return None;
@@ -311,7 +327,7 @@ impl Device {
         if self.pci_id.to_uppercase().starts_with(NVIDIA_PCI_VENDOR)
             && self.get_runtime_status().unwrap_or_default() == GfxPower::Active
         {
-            return nvml();
+            return nvml(&self.dev_path);
         }
 
         None
@@ -328,7 +344,7 @@ impl Device {
     /// If this is a discrete GPU and it is not in the `Active` power state,
     /// this immediately returns `None` without accessing DRM sysfs or NVML to prevent
     /// waking the PCIe device from runtime PM sleep.
-    fn probe_usage(&self, nvml: fn() -> Option<f32>) -> Option<f32> {
+    fn probe_usage(&self, nvml: fn(&Path) -> Option<f32>) -> Option<f32> {
         if self.is_dgpu && self.get_runtime_status().unwrap_or_default() != GfxPower::Active {
             return None;
         }
@@ -366,7 +382,7 @@ impl Device {
         // 4. Fallback to NVML if this is an NVIDIA device and DRM busy is not available
         if self.pci_id.to_uppercase().starts_with(NVIDIA_PCI_VENDOR)
             && self.get_runtime_status().unwrap_or_default() == GfxPower::Active
-            && let Some(usage) = nvml()
+            && let Some(usage) = nvml(&self.dev_path)
         {
             return Some(usage);
         }
@@ -418,25 +434,23 @@ impl Device {
                 if is_gpu_vendor(&id) && is_display_class(&class) {
                     let mut dgpu = false;
                     // Check connected displays to distinguish dGPU from iGPU.
-                    // eDP-1 is the internal panel, always on iGPU.
+                    // eDP-1 is the internal panel, always on iGPU unless routed via MUX.
                     let displays = find_connected_displays(device.syspath()).unwrap_or_default();
-                    if !displays.iter().any(|d| d == "eDP-1") {
+                    let has_edp = displays.iter().any(|d| d == "eDP-1");
+                    if !has_edp && id.starts_with(NVIDIA_PCI_VENDOR) {
                         trace!(
                             "Matched dGPU {id} at {:?} by checking display connections",
                             device.sysname()
                         );
                         dgpu = true;
-                    } else {
+                    } else if has_edp {
                         trace!(
                             "Device {id} at {:?} appears to be the iGPU",
                             device.sysname()
                         );
                     }
-                    if !dgpu && id.starts_with(AMD_PCI_VENDOR) {
-                        trace!(
-                            "Found dGPU Device {id} without boot_vga attribute at {:?}",
-                            device.sysname()
-                        );
+                    if !dgpu && id.starts_with(AMD_PCI_VENDOR) && !has_edp {
+                        trace!("Found AMD GPU {id} without eDP-1 at {:?}", device.sysname());
                         // Fallback: check hwmon for AMD iGPU detection
                         let mut dev_path = PathBuf::from(device.syspath());
                         dev_path.push("hwmon");
@@ -474,10 +488,12 @@ impl Device {
                     } else {
                         info!("Found igpu {id} at {:?}", device.sysname());
                     }
+                    let name = resolve_gpu_name(&device, &id);
                     devices.push(Self {
                         dev_path: PathBuf::from(device.syspath()),
                         is_dgpu: dgpu,
-                        pci_id: id.to_string(),
+                        pci_id: id.into_owned(),
+                        name,
                     });
                 }
             }
@@ -523,7 +539,7 @@ pub fn find_connected_displays(gpu_path: &Path) -> Result<Vec<String>> {
             if fs::read_to_string(entry.path().join("status"))
                 .is_ok_and(|status| status.trim() == "connected")
             {
-                Some(display.to_string())
+                Some(display.to_owned())
             } else {
                 None
             }
@@ -560,7 +576,10 @@ pub fn get_gpu_power_status() -> GfxPower {
 }
 
 fn lookup_amdgpu_name(device_id: &str, revision: &str) -> Option<String> {
-    let content = fs::read_to_string("/usr/share/libdrm/amdgpu.ids").ok()?;
+    static AMDGPU_IDS: OnceLock<Option<String>> = OnceLock::new();
+    let content = AMDGPU_IDS
+        .get_or_init(|| fs::read_to_string("/usr/share/libdrm/amdgpu.ids").ok())
+        .as_deref()?;
     for line in content.lines().map(str::trim) {
         if line.starts_with('#') || line.is_empty() {
             continue;
@@ -571,81 +590,90 @@ fn lookup_amdgpu_name(device_id: &str, revision: &str) -> Option<String> {
             && parts[1].eq_ignore_ascii_case(revision)
             && !parts[2].is_empty()
         {
-            return Some(parts[2].to_string());
+            return Some(parts[2].to_owned());
         }
     }
     None
+}
+
+fn resolve_gpu_name(device: &udev::Device, id_val: &str) -> String {
+    let mut parts = id_val.split(':');
+    let vendor = parts.next().unwrap_or("");
+    let device_id = parts.next().unwrap_or("");
+
+    let mut model_name = String::new();
+    if vendor.eq_ignore_ascii_case(AMD_PCI_VENDOR) && !device_id.is_empty() {
+        let revision_path = device.syspath().join("revision");
+        let revision = std::fs::read_to_string(revision_path)
+            .unwrap_or_default()
+            .trim()
+            .trim_start_matches("0x")
+            .to_lowercase();
+        if let Some(amd_name) = lookup_amdgpu_name(device_id, &revision) {
+            model_name = amd_name;
+        }
+    }
+
+    if model_name.is_empty()
+        && let Some(model) = device.property_value("ID_MODEL_FROM_DATABASE")
+    {
+        model_name = model.to_string_lossy().into_owned();
+    }
+    if model_name.is_empty() {
+        model_name = id_val.to_owned();
+    }
+    if model_name.is_empty() {
+        model_name = "Unknown GPU".to_owned();
+    }
+    model_name
 }
 
 pub fn get_gpu_names() -> (String, String) {
     let mut igpu = None;
     let mut dgpu = None;
 
-    if let Ok(mut enumerator) = udev::Enumerator::new()
-        && enumerator.match_subsystem("pci").is_ok()
-        && let Ok(devices) = enumerator.scan_devices()
-    {
+    if let Ok(devices) = Device::find() {
         for device in devices {
-            if let Some(class) = device.property_value("PCI_CLASS") {
-                let class_str = class.to_string_lossy();
-                if class_str.starts_with("03") || class_str.starts_with("3") {
-                    let id_val = device
-                        .property_value("PCI_ID")
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-
-                    let mut parts = id_val.split(':');
-                    let vendor = parts.next().unwrap_or("").to_lowercase();
-                    let device_id = parts.next().unwrap_or("").to_lowercase();
-
-                    let mut model_name = String::new();
-                    if vendor.eq_ignore_ascii_case(AMD_PCI_VENDOR) && !device_id.is_empty() {
-                        let revision_path = device.syspath().join("revision");
-                        let revision = std::fs::read_to_string(revision_path)
-                            .unwrap_or_default()
-                            .trim()
-                            .trim_start_matches("0x")
-                            .to_lowercase();
-                        if let Some(amd_name) = lookup_amdgpu_name(&device_id, &revision) {
-                            model_name = amd_name;
-                        }
-                    }
-
-                    if model_name.is_empty()
-                        && let Some(model) = device.property_value("ID_MODEL_FROM_DATABASE")
-                    {
-                        model_name = model.to_string_lossy().into_owned();
-                    }
-                    if model_name.is_empty() {
-                        model_name = id_val.clone();
-                    }
-                    if model_name.is_empty() {
-                        model_name = "Unknown GPU".to_string();
-                    }
-
-                    let is_dgpu = vendor.eq_ignore_ascii_case(NVIDIA_PCI_VENDOR)
-                        || model_name.contains("GeForce")
-                        || model_name.contains("Radeon RX")
-                        || model_name.contains("Discrete");
-
-                    if is_dgpu {
-                        dgpu = Some(model_name);
-                    } else {
-                        igpu = Some(model_name);
-                    }
+            if device.is_dgpu {
+                if dgpu.is_none() {
+                    dgpu = Some(device.name);
                 }
+            } else if igpu.is_none() {
+                igpu = Some(device.name);
             }
         }
     }
 
     (
-        igpu.unwrap_or_else(|| "Integrated GPU".to_string()),
-        dgpu.unwrap_or_else(|| "Discrete GPU".to_string()),
+        igpu.unwrap_or_else(|| "Integrated GPU".to_owned()),
+        dgpu.unwrap_or_else(|| "Discrete GPU".to_owned()),
     )
 }
 
+/// Telemetry metrics for an individual discrete GPU.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DgpuTelemetry {
+    pub name: String,
+    pub temp: f32,
+    pub usage: f32,
+    pub suspended: bool,
+    pub freq_mhz: f32,
+}
+
+impl Default for DgpuTelemetry {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            temp: -1.0,
+            usage: -1.0,
+            suspended: false,
+            freq_mhz: -1.0,
+        }
+    }
+}
+
 /// Telemetry metrics for both integrated and discrete GPUs.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GpuTelemetry {
     pub igpu_temp: f32,
     pub igpu_usage: f32,
@@ -653,6 +681,7 @@ pub struct GpuTelemetry {
     pub dgpu_usage: f32,
     pub dgpu_suspended: bool,
     pub dgpu_freq_mhz: f32,
+    pub dgpus: Vec<DgpuTelemetry>,
 }
 
 impl Default for GpuTelemetry {
@@ -664,6 +693,7 @@ impl Default for GpuTelemetry {
             dgpu_usage: -1.0,
             dgpu_suspended: false,
             dgpu_freq_mhz: -1.0,
+            dgpus: Vec::new(),
         }
     }
 }
@@ -671,18 +701,43 @@ impl Default for GpuTelemetry {
 /// Retrieve telemetry metrics for all detected GPUs in a single udev scan.
 pub fn get_gpu_telemetry() -> GpuTelemetry {
     let mut telemetry = GpuTelemetry::default();
-    let power_status = get_gpu_power_status();
-    let dgpu_active = power_status == GfxPower::Active;
-    telemetry.dgpu_suspended = power_status == GfxPower::Suspended;
+    let dgpu_disabled = asus_dgpu_disabled().unwrap_or(false);
 
     if let Ok(devices) = Device::find() {
         for device in devices {
             if device.is_dgpu() {
-                if dgpu_active {
-                    telemetry.dgpu_temp = device.get_temp().unwrap_or(-1.0);
-                    telemetry.dgpu_usage = device.get_usage_pct().unwrap_or(-1.0);
-                    telemetry.dgpu_freq_mhz = device.get_freq_mhz().unwrap_or(-1.0);
+                let status = if dgpu_disabled {
+                    GfxPower::AsusDisabled
+                } else {
+                    device.get_runtime_status().unwrap_or_default()
+                };
+                let dgpu_active = status == GfxPower::Active;
+                let dgpu = DgpuTelemetry {
+                    name: device.name().to_owned(),
+                    temp: if dgpu_active {
+                        device.get_temp().unwrap_or(-1.0)
+                    } else {
+                        -1.0
+                    },
+                    usage: if dgpu_active {
+                        device.get_usage_pct().unwrap_or(-1.0)
+                    } else {
+                        -1.0
+                    },
+                    suspended: status == GfxPower::Suspended,
+                    freq_mhz: if dgpu_active {
+                        device.get_freq_mhz().unwrap_or(-1.0)
+                    } else {
+                        -1.0
+                    },
+                };
+                if telemetry.dgpus.is_empty() {
+                    telemetry.dgpu_temp = dgpu.temp;
+                    telemetry.dgpu_usage = dgpu.usage;
+                    telemetry.dgpu_suspended = dgpu.suspended;
+                    telemetry.dgpu_freq_mhz = dgpu.freq_mhz;
                 }
+                telemetry.dgpus.push(dgpu);
             } else {
                 telemetry.igpu_temp = device.get_temp().unwrap_or(-1.0);
                 telemetry.igpu_usage = device.get_usage_pct().unwrap_or(-1.0);
@@ -725,7 +780,8 @@ mod tests {
         Device {
             dev_path,
             is_dgpu: true,
-            pci_id: "10DE:2820".to_string(),
+            pci_id: "10DE:2820".to_owned(),
+            name: "Fake GPU".to_owned(),
         }
     }
 
@@ -736,7 +792,8 @@ mod tests {
         Device {
             dev_path,
             is_dgpu: true,
-            pci_id: pci_id.to_string(),
+            pci_id: pci_id.to_owned(),
+            name: "Fake Active GPU".to_owned(),
         }
     }
 
@@ -903,10 +960,11 @@ mod tests {
         let device = Device {
             dev_path: dir.0.clone(),
             is_dgpu: false,
-            pci_id: "10DE:228E".to_string(),
+            pci_id: "10DE:228E".to_owned(),
+            name: "Fake Audio".to_owned(),
         };
 
-        fn panic_on_nvml() -> Option<f32> {
+        fn panic_on_nvml(_: &Path) -> Option<f32> {
             panic!("NVML fallback must not be called when runtime_status is not Active");
         }
 

@@ -5,7 +5,7 @@
 //! functions (`Device::find`, `get_gpu_power_status`) are tested via integration
 //! tests on machines with actual GPUs.
 
-use rog_platform::gpu_pci::{GfxPower, GpuTelemetry, lspci_dgpu_check};
+use rog_platform::gpu_pci::{DgpuTelemetry, GfxPower, GpuTelemetry, lspci_dgpu_check};
 use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
@@ -21,6 +21,14 @@ fn gpu_telemetry_default_values() {
     assert_eq!(telemetry.dgpu_usage, -1.0);
     assert_eq!(telemetry.dgpu_freq_mhz, -1.0);
     assert!(!telemetry.dgpu_suspended);
+    assert!(telemetry.dgpus.is_empty());
+
+    let dgpu = DgpuTelemetry::default();
+    assert!(dgpu.name.is_empty());
+    assert_eq!(dgpu.temp, -1.0);
+    assert_eq!(dgpu.usage, -1.0);
+    assert_eq!(dgpu.freq_mhz, -1.0);
+    assert!(!dgpu.suspended);
 }
 
 // ---------------------------------------------------------------------------
