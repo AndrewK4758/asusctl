@@ -12,7 +12,7 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use super::show_toast;
 use crate::config::Config;
 use crate::zbus_proxies::{AppState, find_iface_async};
-use crate::{AttrMinMax, MainWindow, SystemPageData, set_ui_callbacks};
+use crate::{AttrMinMax, DgpuStatus, MainWindow, SystemPageData, set_ui_callbacks};
 
 const MINMAX: AttrMinMax = AttrMinMax {
     min: 0,
@@ -68,24 +68,49 @@ pub fn setup_system_page(
     ui.global::<SystemPageData>()
         .set_ppt_enabled_available(false);
 
-    let has_dgpu = {
-        let devices = rog_platform::gpu_pci::Device::find().unwrap_or_default();
-        devices.iter().any(|d| d.is_dgpu())
-            || rog_platform::gpu_pci::asus_dgpu_disable_exists()
-            || rog_platform::gpu_pci::asus_gpu_mux_exists()
-    };
+    let devices = rog_platform::gpu_pci::Device::find().unwrap_or_default();
+    let has_dgpu = devices.iter().any(|d| d.is_dgpu())
+        || rog_platform::gpu_pci::asus_dgpu_disable_exists()
+        || rog_platform::gpu_pci::asus_gpu_mux_exists();
     ui.global::<SystemPageData>().set_has_dgpu(has_dgpu);
 
     let cpu_model = rog_platform::cpu::get_cpu_model();
     let (igpu_model, dgpu_model) = rog_platform::gpu_pci::get_gpu_names();
     let has_igpu = igpu_model != "Integrated GPU" && !igpu_model.is_empty();
 
+    let initial_dgpus: Vec<DgpuStatus> = {
+        let found: Vec<DgpuStatus> = devices
+            .iter()
+            .filter(|d| d.is_dgpu())
+            .map(|d| DgpuStatus {
+                name: d.name().into(),
+                temp: -1.0,
+                usage: -1.0,
+                suspended: false,
+            })
+            .collect();
+        if found.is_empty() && has_dgpu {
+            vec![
+                DgpuStatus {
+                    name: dgpu_model.clone().into(),
+                    temp: -1.0,
+                    usage: -1.0,
+                    suspended: false,
+                },
+            ]
+        } else {
+            found
+        }
+    };
+
     ui.global::<SystemPageData>().set_cpu_name(cpu_model.into());
     ui.global::<SystemPageData>()
         .set_igpu_name(igpu_model.into());
     ui.global::<SystemPageData>()
-        .set_dgpu_name(dgpu_model.into());
+        .set_dgpu_name(dgpu_model.clone().into());
     ui.global::<SystemPageData>().set_has_igpu(has_igpu);
+    ui.global::<SystemPageData>()
+        .set_dgpus(ModelRc::new(VecModel::from(initial_dgpus)));
 
     if let Ok(sys_props) = platform
         .supported_properties()
@@ -152,6 +177,27 @@ pub fn setup_system_page(
             let ram_usage = rog_platform::cpu::get_ram_usage_pct();
             let gpu_usage = gpu_telemetry.dgpu_usage;
             let igpu_usage = gpu_telemetry.igpu_usage;
+            let dgpus: Vec<DgpuStatus> = if gpu_telemetry.dgpus.is_empty() && has_dgpu {
+                vec![
+                    DgpuStatus {
+                        name: dgpu_model.clone().into(),
+                        temp: gpu_temp,
+                        usage: gpu_usage,
+                        suspended: dgpu_suspended,
+                    },
+                ]
+            } else {
+                gpu_telemetry
+                    .dgpus
+                    .into_iter()
+                    .map(|g| DgpuStatus {
+                        name: g.name.into(),
+                        temp: g.temp,
+                        usage: g.usage,
+                        suspended: g.suspended,
+                    })
+                    .collect()
+            };
 
             let curr_ticks = rog_platform::cpu::read_cpu_ticks();
             let cpu_usage = if let (Some(p), Some(c)) = (&prev_ticks, &curr_ticks) {
@@ -184,6 +230,7 @@ pub fn setup_system_page(
                 data.set_cpu_usage_val(cpu_usage);
                 data.set_gpu_usage_val(gpu_usage);
                 data.set_igpu_usage_val(igpu_usage);
+                data.set_dgpus(ModelRc::new(VecModel::from(dgpus)));
                 data.set_ram_usage_val(ram_usage);
                 data.set_cpu_freq_mhz(cpu_freq);
                 data.set_cpu_fan_rpm(cpu_fan);
